@@ -1,291 +1,144 @@
-#importing necessary libraries 
-import os
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.chains import create_tagging_chain_pydantic,LLMChain
-import pandas as pd
-from pydantic import BaseModel, Field
-import streamlit as st
-import time
+from fastapi import FastAPI
+from pydantic import BaseModel
+import spacy
+import openai
+import re
+import uvicorn
 
-__version__ = "GPT3"
+openai.api_key = ""
 
-#set the openai environment
+# Initialize global variables to store extracted information
+global_info = {
+    "name": "",
+    "email": "",
+    "address": "",
+    "education": "",
+    "phone": "",
+    "dob": "",
+}
 
-os.environ["OPENAI_API_KEY"] = ""
+#Function to extract information from the user 
+#Function to extract information from the user 
+def extract_information(text):
+    global global_info
+
+    # Load the English NLP model in spaCy
+    nlp = spacy.load("en_core_web_sm")
+
+    # Process the text with spaCy
+    doc = nlp(text)
+
+    # Extract information using spaCy's NER
+    for ent in doc.ents:
+        if ent.label_ == "PERSON":
+            global_info["name"] = ent.text
+        elif ent.label_ == "GPE":
+            global_info["address"] = ent.text
+        elif ent.label_ == "DATE":
+            # Check if the date is in a valid format (e.g., YYYY-MM-DD)
+            if re.match(r'\d{4}-\d{2}-\d{2}', ent.text):
+                global_info["dob"] = ent.text
+
+    # Extract education information using regular expressions
+    education_keywords = r"(secondary school|high school|diploma|bachelor's|bachelors|master's|masters)"
+    education_match = re.search(education_keywords, text, re.IGNORECASE)
+
+    if education_match:
+        global_info["education"] = education_match.group(0)
+
+    # Access phone number and email using regular expressions
+    phone_pattern = r'\d{10,14}' #check for digits 0-9 within range of 10-14 numbers
+    email_pattern = r'\S+@\S+' #pattern matching for email
+
+    phone_match = re.search(phone_pattern, text)
+    email_match = re.search(email_pattern, text)
+
+    if phone_match:
+        global_info["phone"] = phone_match.group()
+    if email_match:
+        global_info["email"] = email_match.group()
 
 
-# Information to extract : Name, email, phone no, Address, Date of birth, Education.
 
-# Defining the schema for above use case with Pydantic
+#initialize message history with business object and first prompt
+messages=[
+      {"role": "system", "content": """
+                        You are Jarvis, the AI chatbot, represents Learntube, specializing in online education. 
+                        Your primary task is data collection during from user with engaging conversations about AI and the companys objective, avoiding the feel of a static Google form. 
+                        You're to gather essential info_item = (name, email, address, phone, DOB, and education). Here are some Key Actions you need to follow strictly.
+                        Key Actions:
+                        !!Important : (1. Ask for each element from info_item in between 2-3 user and assistant conversations.Begin with requesting the user's name and subsequently  
+                        collect all the elements within info_item similarly like each element in between 2-3 user and assistant conversations before the user exits the conversation)
+                        2. Request each detail with context and explanations. For example, ask for the email for newsletters, 
+                         date of birth (DOB) for age-oriented courses, and education level for expertise-related courses. 
+                        3. Keep conversations AI-centric, steering back to the company's objectives and AI topics.)
+                        4. Strictly Maintain  your responses less than 100 words 
+                        5. Reassure users about data privacy and request explicit consent for storage and use.
+                        6. Validate name (min. 2 characters), email with valid domains (.com, .org, .net).
+                        7. Ensure proper addresses, excluding unrealistic inputs.
+                        8. Check DOB format (YYYY-MM-DD) and realism. 
+                        9. Verify phone numbers (under 14 digits) with recognized formats.
+                        10. Prompt for valid education levels (e.g., secondary school, bachelors).
+                        11. Provide guidance and assistance for incorrect or incomplete responses.
+                        12. Offer help to struggling users.
+                        13. Prompt for accurate details if gibberish or irrelevant info is given.
+                        14. Prioritize ethical considerations and avoid harmful content.
+                        15. Convince users that providing info enhances their experience.
+                        16. Avoid overwhelming users with excessive information.
+                        17. Omit instructions when users provide info correctly.
+                        Keep all this in mind during your conversations.
+"""},
+      {"role": "assistant", "content": "Hey There! Tech Explorer , How may I help you today?"}
+  ]
 
-# make sure this is set None else it will thow error if we define it as compulsory field with ' ... '
+# Funtion to store message history
+def update_messages(messages, role, content):
+  messages.append({"role": role, "content": content})
+  return messages
 
-class Tags(BaseModel):
-
-    Name: str = Field( 
-        None,  
-        
-        description="This will contain information on full name of the user")
-    
-    Email: str = Field(
-        None,
-        description="This will contain information on email of the user")
-    
-    Phone : int = Field(
-        None, 
-        description="This will contain information on phone number of the user")
-    
-    Address : str = Field(
-        None, 
-        description="This will contain information on Address of the user")
-    
-    DOB: str = Field(
-        None, 
-        description="This will contain information on Date of Birth of the user")
-
-    Education: str = Field(
-       None, 
-        description="This will contain information on Level Of Education of the user") 
-    
-#Define the model
-
-llm = ChatOpenAI(temperature=0)
-# chain = create_tagging_chain_pydantic(Tags, llm)
-
-#This function will check for fields which are still yet to be filled with information required
-def check_empty_fields(any_user_details):
-    ask_for = [field for field, value in any_user_details.__dict__.items() if value in [None, "", 0]]
-    
-    return ask_for
-
-#Validating the response and adding it to the current instance of Object
-def fill_details(current_details: Tags, new_details: Tags):
-
-    non_empty_details = {k: v for k, v in new_details.__dict__.items() if v not in [None, ""]}
-    updated_details = current_details.copy(update=non_empty_details)
-    return updated_details 
-
-#this function will provide a template to agent on how to proceed with the conversation
-
-def ask_for_info(ask_for):
-
-  # prompt template 1
-  first_prompt = ChatPromptTemplate.from_template(
-      "Below is are some things to ask the user for in a coversation way. you should only ask one question at a time even not all at once \
-      don't ask as a list! Don't greet the user ! . Strict rule: Only if user is hesitant to response or not giving information tell convince them their data is safe . If the ask_for list is empty then thank them and and tell well get back soon \n\n \
-      ### ask_for list: {ask_for}"
+#instance of the gpt model to give response for user request.
+def chatgpt_response(messages):
+  response = openai.ChatCompletion.create(
+  model="gpt-3.5-turbo",
+  messages=messages,
+  temperature=0.1
   )
-
-
-  # info_gathering_chain
-  info_gathering_chain = LLMChain(llm=llm, prompt=first_prompt)
-  ai_chat = info_gathering_chain.run(ask_for=ask_for)
-  return ai_chat
-
-#This function will help to keep a track of variable we are storing and making sure not to repeat any information
-
-def filter_response(text_input, user_details):
-    chain = create_tagging_chain_pydantic(Tags, llm)
-    res = chain.run(text_input)
-    # add filtered info to the
-    user_details = fill_details(user_details,res)
-    ask_for = check_empty_fields(user_details)
-    return user_details, ask_for
-
-# function to store data in csv which will take user details as input 
-
-def append_data_to_csv(new_data_dict):
-    # Define the column names
-    columns = ['Name', 'Email', 'Phone', 'Address', 'DOB', 'Education']
-
-    # Check if the CSV file exists or create a new one
-    try:
-        df = pd.read_csv('data.csv')
-    except FileNotFoundError:
-        df = pd.DataFrame(columns=columns)
-
-    # Append the new data as a row to the DataFrame
-    df = df.append(new_data_dict, ignore_index=True)
-
-    # Save the DataFrame to the CSV file
-    df.to_csv('data.csv', index=False)
-
-
-#Initialing empty user 
-
-test_user_details = Tags(Name="",
-                        Email	="",
-                        Phone= 0,
-                        Address="",
-                        DOB="",
-                        Education="")
-
-
-
-#Starting with chat bot interface using stream lit 
-
-#Setting the heading for the chatbot 
-
-st.title("Unlock Excellence : Elevate Your Skills with Top Learning Content, Certifications, and Career Support! Share Your Info Below for Personalized Guidance on Your Journey to Success.")
-
-# # Initialize chat history
-# if "messages" not in st.session_state:
-#     st.session_state.messages = []
-
-# # Display chat messages from history on app rerun
-# for message in st.session_state.messages:
-#     with st.chat_message(message["role"]):
-#         st.markdown(message["content"])
-
-# #Initial Conversation
-# message = ask_for_info()
-# st.chat_message("Assitant").markdown(message)
-
-# user_text = st.chat_input("Give your response here")
-# st.chat_message("User").markdown(user_text)
-
-# user_details, ask_for = filter_response(user_text, test_user_details)
-
-
-
-# ask_for = True
-# run_once_flag = True
-
-
-#Initial Message
-
-message = ask_for_info(['Name'])
-
-st.write(f'Assitant : {message}')
-
-user_input = st.text_input('You can respond here',key = 'val1' )
-st.write(f'User: {user_input}')
-
-user_details, ask_for = filter_response(user_input, test_user_details)
-
-time.sleep(55)
-
-# check on ask condition 
-
-if ask_for:
-
-    message = ask_for_info(ask_for)
-    st.write(f'Assitant : {message}')
-
-    user_input = st.text_input('You can respond here',key = 'val2' )
-    st.write(f'User: {user_input}')
-
-    user_details, ask_for = filter_response(user_input, test_user_details)
-    pass
-
-time.sleep(55)
-
-if ask_for:
-
-    message = ask_for_info(ask_for)
-    st.write(f'Assitant : {message}')
-
-    user_input = st.text_input('You can respond here',key = 'val3' )
-    st.write(f'User: {user_input}')
-
-    user_details, ask_for = filter_response(user_input, test_user_details)
-
-time.sleep(55)
-
-if ask_for:
-
-    message = ask_for_info(ask_for)
-    st.write(f'Assitant : {message}')
-
-    user_input = st.text_input('You can respond here',key = 'val4' )
-    st.write(f'User: {user_input}')
-
-    user_details, ask_for = filter_response(user_input, test_user_details)
-
-time.sleep(55)
-
-if ask_for:
-
-    message = ask_for_info(ask_for)
-    st.write(f'Assitant : {message}')
-
-    user_input = st.text_input('You can respond here',key = 'val5' )
-    st.write(f'User: {user_input}')
-
-    user_details, ask_for = filter_response(user_input, test_user_details) 
-
-time.sleep(55)    
-
-if ask_for:
-
-    message = ask_for_info(ask_for)
-    st.write(f'Assitant : {message}')
-
-    user_input = st.text_input('You can respond here',key = 'val6' )
-    st.write(f'User: {user_input}')
-
-    user_details, ask_for = filter_response(user_input, test_user_details)   
-
-
-
-# st.write(f'User : {user_input}')
-
-#     user_input = st.chat_input("Enter your response",key = f'{i}')
-#     st.chat_message("user").markdown(user_input)
-#     st.session_state.messages.append({"role": "user", "content": user_input})
-
-#     time.sleep(30)
-
-#     user_details, ask_for = filter_response(user_input, test_user_details)
-
-#     time.sleep(30)
-
-
-
-
-# #Rest of the conversation
-# while ask_for:
-
-#     if run_once_flag:
+  return  response['choices'][0]['message']['content']
+
+# Function to handle user messages
+def handle_user_message(user_input):
+    extract_information(user_input)
+    messages.append({"role": "user", "content": user_input})
+    model_response = chatgpt_response(messages)
+    messages.append({"role": "assistant", "content": model_response})
+    return model_response
+
+# Initialize the FAST API app
+app = FastAPI()
+
+# Define data model for request and response
+class UserMessage(BaseModel):
+    content: str
+
+class BotResponse(BaseModel):
+    content: str
+
+@app.get("/")
+def home():
+    return {"health_check": "OK"}
+
+# Route to handle user messages
+@app.post("/message", response_model=BotResponse)
+def handle_message(user_message: UserMessage):
+    user_input = user_message.content
+    model_response = handle_user_message(user_input)
+    return {'content': model_response}
+
+# Your chatgpt_response function here
+
+# Run the FAST API app
+if __name__ == "__main__":
     
-#         #Initial Conversation
-        
-#         message = ask_for_info()
-        
-#         # Display user message in chat message container
-#         st.chat_message("Assitant").markdown(message)
-#         st.session_state.messages.append({"role": "assistant", "content": message})
+    uvicorn.run(app,host='127.0.0.1',port = 8000)
 
-#         user_input = st.chat_input("Enter your first response")
-
-#         # Display user message in chat message container
-#         st.chat_message("user").markdown(user_input)
-
-#         # Add user message to chat history
-#         st.session_state.messages.append({"role": "user", "content": user_input})
-
-#         user_details, ask_for = filter_response(user_input, test_user_details)
-
-#         # Set the flag to False after running the code
-#         run_once_flag = False
-#         time.sleep(30)
-
-# #for the rest of the questions 
-#     ai_response = ask_for_info(ask_for)
-#     st.chat_message("Assitant").markdown(ai_response)
-#     st.session_state.messages.append({"role": "assistant", "content": ai_response})
-
-#     user_input= st.chat_input("Give your response here")
-#     st.chat_message("User").markdown(user_input)
-#     st.session_state.messages.append({"role": "user", "content": user_input})
-
-#     time.sleep(25)
-
-#     user_details, ask_for = filter_response(user_input, user_details)
-
-#     time.sleep(25) #Gpt model doesnt allow more than 3 request per minute
-
-st.write("Thank you for the information , we will reach out to you asap")
-
-append_data_to_csv(user_details.__dict__)
+    #Run with this command: uvicorn main:app --reload
